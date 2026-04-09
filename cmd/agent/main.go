@@ -26,14 +26,16 @@ import (
 )
 
 // ── Sheet column headers ───────────────────────────────────────────────────────
+// A  B           C          D           E          F            G             H             I        J     K     L             M                  N                  O
+// SN Message ID  Thread ID  Group Name  Group JID  Sender Name  Sender Phone  Message Type  Message  Date  Time  Reply Status  Replied By Names   Replied By Phones  Replies
 var sheetHeaders = []interface{}{
 	"SN", "Message ID", "Thread ID",
 	"Group Name", "Group JID",
 	"Sender Name", "Sender Phone",
-	"Message Type", "Message", "Quoted Message",
+	"Message Type", "Message",
 	"Date", "Time",
-	"Is Reply", "Replied To Message ID", "Replied To Sender",
 	"Reply Status",
+	"Replied By Names", "Replied By Phones", "Replies",
 }
 
 // ── Message record struct ──────────────────────────────────────────────────────
@@ -46,12 +48,10 @@ type Record struct {
 	SenderPhone        string
 	MessageType        string
 	Message            string
-	QuotedMessage      string
 	Date               string
 	Time               string
 	IsReply            bool
-	RepliedToMessageID string
-	RepliedToSender    string
+	RepliedToMessageID string // ID of the message being replied to
 }
 
 // ── Agent ──────────────────────────────────────────────────────────────────────
@@ -210,17 +210,14 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 		}
 
 		// Reply threading
-		var replyMsgID, replySender, quotedText string
+		var replyMsgID string
 		var isReply bool
 		if ci := contextInfo(v.Message); ci != nil && ci.GetQuotedMessage() != nil {
 			isReply = true
 			replyMsgID = ci.GetStanzaID()
-			// Strip @domain from participant
-			replySender = strings.Split(ci.GetParticipant(), "@")[0]
-			_, quotedText = extractText(ci.GetQuotedMessage())
 		}
 
-		// Thread ID: parent message if reply, own ID otherwise
+		// Thread ID: root of the thread
 		threadID := v.Info.ID
 		if replyMsgID != "" {
 			threadID = replyMsgID
@@ -241,12 +238,10 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 			SenderPhone:        phone,
 			MessageType:        msgType,
 			Message:            msgText,
-			QuotedMessage:      quotedText,
 			Date:               v.Info.Timestamp.Format("2006-01-02"),
 			Time:               v.Info.Timestamp.Format("15:04:05"),
 			IsReply:            isReply,
 			RepliedToMessageID: replyMsgID,
-			RepliedToSender:    replySender,
 		}
 
 		select {
@@ -257,9 +252,32 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 	}
 }
 
-// ── Sheet writer ───────────────────────────────────────────────────────────────
+// ── Sheet helpers ──────────────────────────────────────────────────────────────
+
+func cellStr(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func appendCSV(existing, val string) string {
+	if existing == "" {
+		return val
+	}
+	return existing + ", " + val
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ensureHeaders writes the header row if not already present.
 func (a *Agent) ensureHeaders() {
-	rangeStr := a.sheetName + "!A1:P1"
+	rangeStr := a.sheetName + "!A1:O1"
 	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, rangeStr).Do()
 	if err != nil || len(resp.Values) == 0 {
 		vr := &sheets.ValueRange{Values: [][]interface{}{sheetHeaders}}
@@ -268,17 +286,87 @@ func (a *Agent) ensureHeaders() {
 	}
 }
 
-func (a *Agent) writeToSheet(rec Record) {
-	// Get row count for SN
+// findRowByMessageID searches column B for the given message ID.
+// Returns 1-based row number or -1 if not found.
+func (a *Agent) findRowByMessageID(msgID string) (int, error) {
+	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, a.sheetName+"!B:B").Do()
+	if err != nil {
+		return -1, err
+	}
+	for i, row := range resp.Values {
+		if len(row) > 0 && cellStr(row[0]) == msgID {
+			return i + 1, nil // 1-based
+		}
+	}
+	return -1, nil
+}
+
+// appendReply finds the original message row and appends the reply info into
+// columns L (Reply Status), M (Replied By Names), N (Replied By Phones), O (Replies).
+func (a *Agent) appendReply(rec Record) {
+	rowNum, err := a.findRowByMessageID(rec.RepliedToMessageID)
+	if err != nil {
+		fmt.Printf("[ERROR] Sheet search failed: %v\n", err)
+		return
+	}
+	if rowNum == -1 {
+		// Original not in sheet yet — store as standalone row with context
+		fmt.Printf("[WARN] Original msg %s not found in sheet, writing reply as new row\n", rec.RepliedToMessageID)
+		a.appendNewRow(rec)
+		return
+	}
+
+	// Read current L:O values
+	rangeStr := fmt.Sprintf("%s!L%d:O%d", a.sheetName, rowNum, rowNum)
+	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, rangeStr).Do()
+
+	var existingStatus, existingNames, existingPhones, existingReplies string
+	if err == nil && len(resp.Values) > 0 {
+		row := resp.Values[0]
+		if len(row) > 0 {
+			existingStatus = cellStr(row[0])
+		}
+		if len(row) > 1 {
+			existingNames = cellStr(row[1])
+		}
+		if len(row) > 2 {
+			existingPhones = cellStr(row[2])
+		}
+		if len(row) > 3 {
+			existingReplies = cellStr(row[3])
+		}
+	}
+	_ = existingStatus
+
+	updatedNames := appendCSV(existingNames, rec.SenderName)
+	updatedPhones := appendCSV(existingPhones, rec.SenderPhone)
+	updatedReplies := appendCSV(existingReplies, rec.Message)
+
+	vr := &sheets.ValueRange{
+		Values: [][]interface{}{{
+			"Replied",
+			updatedNames,
+			updatedPhones,
+			updatedReplies,
+		}},
+	}
+	_, err = a.sheetsvc.Spreadsheets.Values.Update(a.sheetID, rangeStr, vr).
+		ValueInputOption("USER_ENTERED").Do()
+	if err != nil {
+		fmt.Printf("[ERROR] Reply update failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("[%s %s] %s | REPLY by %s → \"%s\"\n",
+		rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.Message)
+}
+
+// appendNewRow writes a brand-new message as a new sheet row.
+func (a *Agent) appendNewRow(rec Record) {
 	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, a.sheetName+"!A:A").Do()
 	sn := 1
 	if err == nil && len(resp.Values) > 0 {
-		sn = len(resp.Values) // header = row 1, first data SN = 1 (len = 1 before append)
-	}
-
-	isReplyStr := "No"
-	if rec.IsReply {
-		isReplyStr = "Yes"
+		sn = len(resp.Values)
 	}
 
 	row := []interface{}{
@@ -291,13 +379,12 @@ func (a *Agent) writeToSheet(rec Record) {
 		rec.SenderPhone,
 		rec.MessageType,
 		rec.Message,
-		rec.QuotedMessage,
 		rec.Date,
 		rec.Time,
-		isReplyStr,
-		rec.RepliedToMessageID,
-		rec.RepliedToSender,
-		"Not Replied",
+		"Not Replied", // L: Reply Status
+		"",            // M: Replied By Names
+		"",            // N: Replied By Phones
+		"",            // O: Replies
 	}
 
 	vr := &sheets.ValueRange{Values: [][]interface{}{row}}
@@ -306,23 +393,20 @@ func (a *Agent) writeToSheet(rec Record) {
 		InsertDataOption("INSERT_ROWS").
 		Do()
 	if err != nil {
-		fmt.Printf("[ERROR] Sheet write failed: %v\n", err)
+		fmt.Printf("[ERROR] Sheet append failed: %v\n", err)
 		return
 	}
 
-	replyTag := ""
-	if rec.IsReply {
-		replyTag = " [REPLY→" + rec.RepliedToMessageID[:min(8, len(rec.RepliedToMessageID))] + "]"
-	}
-	fmt.Printf("[%s %s] %s | %s: %s%s\n",
-		rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.Message, replyTag)
+	fmt.Printf("[%s %s] %s | %s: %s\n",
+		rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.Message)
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func (a *Agent) writeToSheet(rec Record) {
+	if rec.IsReply {
+		a.appendReply(rec)
+	} else {
+		a.appendNewRow(rec)
 	}
-	return b
 }
 
 func (a *Agent) runWriter(ctx context.Context) {
