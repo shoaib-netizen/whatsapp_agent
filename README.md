@@ -1,93 +1,101 @@
-# WhatsApp-Agent
+# WhatsApp Agent (Go)
 
+This folder contains the Go implementation plan for the WhatsApp group CRM agent.
 
+## Goal
 
-## Getting started
+Build a passive WhatsApp group logger that:
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- Listens to group messages using whatsmeow
+- Captures sender name, sender number, message text, timestamp, group
+- Detects reply/quote links to parent messages
+- Writes structured records to Google Sheets
+- Generates optional LLM summaries in controlled batches
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Analysis of Provided Files
 
-## Add your files
+- The file in GOLANG/pkgfile.md confirms whatsmeow has the required event APIs for:
+	- receiving group messages
+	- message key handling used for replies/reactions
+	- group info and participant metadata
+- The file in GOLANG/context7.md points to useful context7 references for whatsmeow docs/skills/benchmarks.
+- This folder initially had only a default GitLab template README and no Go project scaffolding yet.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Prerequisites (Windows)
 
-```
-cd existing_repo
-git remote add origin https://gitlab.com/onescreensolutions/whatsapp-agent.git
-git branch -M main
-git push -uf origin main
-```
+### Mandatory
 
-## Integrate with your tools
+1. Go 1.22 or newer
+2. Git
+3. A dedicated WhatsApp number for automation
+4. Google Cloud project with Google Sheets API enabled
+5. Service account JSON credentials for Google Sheets write access
 
-* [Set up project integrations](https://gitlab.com/onescreensolutions/whatsapp-agent/-/settings/integrations)
+### Strongly Recommended
 
-## Collaborate with your team
+1. GCC toolchain (MinGW-w64) only if using CGO sqlite3 driver (not needed for current pure-Go sqlite path)
+2. VS Code Go extension
+3. A stable machine that stays online for session continuity
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## External Accounts and Keys Required
 
-## Test and Deploy
+1. WhatsApp account used for QR linking as a companion device
+2. Google Sheet target and share permission granted to service account email
+3. Optional LLM API key (Anthropic/OpenAI) for periodic summaries
 
-Use the built-in continuous integration in GitLab.
+## Environment Variables (planned)
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+Use the .env.example file in this folder as reference.
 
-***
+Core values you will set:
 
-# Editing this README
+- APP_ENV
+- LOG_LEVEL
+- WHATSAPP_DB_PATH
+- GOOGLE_SHEET_ID
+- GOOGLE_SHEET_NAME
+- GOOGLE_SERVICE_ACCOUNT_JSON
+- SUMMARY_ENABLED
+- ANTHROPIC_API_KEY
+- OPENAI_API_KEY
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+## Preflight Script
 
-## Suggestions for a good README
+Use preflight.ps1 to validate local prerequisites before scaffolding and coding.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+It checks:
 
-## Name
-Choose a self-explaining name for your project.
+- Go installation and version
+- Git availability
+- GCC availability (for sqlite3/cgo path)
+- Presence of .env file
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Next Setup Step
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+After prerequisites pass, we will initialize:
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+1. go.mod
+2. cmd/agent entrypoint
+3. internal packages for config, logger, whatsapp, sheets, storage, summarizer
+4. graceful shutdown and retry logic
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## Link WhatsApp Account First
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+We have added a first command that handles WhatsApp QR pairing and persists the linked session in the local sqlite database.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Run:
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+1. `go mod tidy`
+2. `go run ./cmd/link`
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Then on mobile WhatsApp:
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+1. Open Linked Devices
+2. Tap Link a Device
+3. Scan the QR shown in terminal
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+If it says already linked, delete the local db file set in `WHATSAPP_DB_PATH` and rerun.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## Important Note
 
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+whatsmeow is based on the WhatsApp Web protocol and is unofficial with respect to Meta business APIs. Use a spare account and avoid using a primary business/personal number.
