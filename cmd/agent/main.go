@@ -754,12 +754,8 @@ func (a *Agent) runWriter(ctx context.Context) {
 }
 
 // ── Sheets client ──────────────────────────────────────────────────────────────
-func newSheetsService(ctx context.Context, credPath string) (*sheets.Service, error) {
-	data, err := os.ReadFile(credPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading service account: %w", err)
-	}
-	cfg, err := google.JWTConfigFromJSON(data, sheets.SpreadsheetsScope)
+func newSheetsService(ctx context.Context, credJSON string) (*sheets.Service, error) {
+	cfg, err := google.JWTConfigFromJSON([]byte(credJSON), sheets.SpreadsheetsScope)
 	if err != nil {
 		return nil, fmt.Errorf("parsing service account: %w", err)
 	}
@@ -803,9 +799,10 @@ func main() {
 	}
 
 	// Google Sheets
-	credPath := strings.TrimSpace(os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
-	if credPath == "" {
-		credPath = "./service_account.json"
+	credJSON := strings.TrimSpace(os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+	if credJSON == "" {
+		fmt.Println("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment")
+		os.Exit(1)
 	}
 	sheetID := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_ID"))
 	sheetName := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_NAME"))
@@ -816,7 +813,7 @@ func main() {
 		fmt.Println("GOOGLE_SHEET_ID is not set in .env")
 		os.Exit(1)
 	}
-	svc, err := newSheetsService(ctx, credPath)
+	svc, err := newSheetsService(ctx, credJSON)
 	if err != nil {
 		fmt.Printf("Google Sheets init error: %v\n", err)
 		os.Exit(1)
