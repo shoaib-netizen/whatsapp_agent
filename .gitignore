@@ -1,9 +1,5 @@
 # Local environment and secrets
 .env
-service_account.json
-credentials.json
 
-# Local runtime data
-data/
-*.db
-*.log
+
+
