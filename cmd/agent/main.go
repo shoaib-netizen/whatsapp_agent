@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,10 +30,8 @@ import (
 )
 
 // ── Sheet column headers ───────────────────────────────────────────────────────
-// A   B            C           D             E          F             G               H        I      J             K                  L                   M
-// SN  Sender Name  Sender Phone  Group Name  Group JID  Date Sent     Message Summary  Message  Type  Reply Status  Replied By Names   Replied By Phones   Replies
 var sheetHeaders = []interface{}{
-	"SN", "Sender Name", "Sender Phone",
+	"SN", "Message ID", "Sender Name", "Sender Phone",
 	"Group Name", "Group JID",
 	"Date Sent",
 	"Message Summary", "Message", "Type",
@@ -50,54 +52,211 @@ type Record struct {
 	Date               string
 	Time               string
 	IsReply            bool
-	RepliedToMessageID string // ID of the message being replied to
-	// QuotedMessage holds the text of the quoted/original message when this
-	// record is a reply. It allows us to populate the root row with the
-	// original message's content if it's not already known. For non-replies
-	// this will be empty.
-	QuotedMessage string
-	// QuotedSenderName / QuotedSenderPhone hold the original sender details
-	// extracted from ContextInfo.Participant. Used when the root message is
-	// not in cache so we don't fall back to "Unknown".
-	QuotedSenderName  string
-	QuotedSenderPhone string
+	RepliedToMessageID string
+	QuotedMessage      string
+	QuotedSenderName   string
+	QuotedSenderPhone  string
+}
+
+// ── Supabase DB row (matches the messages table) ───────────────────────────────
+type DBMessage struct {
+	MessageID       string `json:"message_id"`
+	ThreadID        string `json:"thread_id"`
+	GroupName       string `json:"group_name"`
+	GroupJID        string `json:"group_jid"`
+	SenderName      string `json:"sender_name"`
+	SenderPhone     string `json:"sender_phone"`
+	MessageType     string `json:"message_type"`
+	Message         string `json:"message"`
+	Summary         string `json:"summary"`
+	DateSent        string `json:"date_sent"`
+	ReplyStatus     string `json:"reply_status"`
+	RepliedByNames  string `json:"replied_by_names"`
+	RepliedByPhones string `json:"replied_by_phones"`
+	Replies         string `json:"replies"`
+}
+
+// ── Supabase client ────────────────────────────────────────────────────────────
+type SupabaseClient struct {
+	url  string // e.g. https://xxxx.supabase.co
+	key  string // service_role key
+	http *http.Client
+}
+
+func newSupabaseClient(url, key string) *SupabaseClient {
+	return &SupabaseClient{
+		url:  strings.TrimRight(url, "/"),
+		key:  key,
+		http: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func (s *SupabaseClient) do(method, path string, body interface{}, extraHeaders map[string]string) ([]byte, int, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, err
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, s.url+"/rest/v1/"+path, bodyReader)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("apikey", s.key)
+	req.Header.Set("Authorization", "Bearer "+s.key)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return b, resp.StatusCode, nil
+}
+
+// IsSeen returns true if message_id exists in seen_ids table.
+func (s *SupabaseClient) IsSeen(id string) bool {
+	_, status, err := s.do("GET", "seen_ids?message_id=eq."+id+"&select=message_id", nil, nil)
+	if err != nil {
+		return false
+	}
+	// If response is "[]" then not seen
+	return status == 200 && strings.TrimSpace(string([]byte{})) != "[]"
+}
+
+// MarkSeen inserts message_id into seen_ids. Returns true if already existed.
+func (s *SupabaseClient) MarkSeen(id string) (alreadySeen bool) {
+	// Check first
+	b, status, err := s.do("GET", "seen_ids?message_id=eq."+id+"&select=message_id", nil, nil)
+	if err == nil && status == 200 {
+		var rows []map[string]interface{}
+		if json.Unmarshal(b, &rows) == nil && len(rows) > 0 {
+			return true
+		}
+	}
+	// Insert
+	s.do("POST", "seen_ids", map[string]string{"message_id": id},
+		map[string]string{"Prefer": "return=minimal"})
+	return false
+}
+
+// GetMessage fetches a message row by message_id. Returns nil if not found.
+func (s *SupabaseClient) GetMessage(id string) *DBMessage {
+	b, status, err := s.do("GET", "messages?message_id=eq."+id+"&select=*", nil, nil)
+	if err != nil || status != 200 {
+		return nil
+	}
+	var rows []DBMessage
+	if json.Unmarshal(b, &rows) != nil || len(rows) == 0 {
+		return nil
+	}
+	return &rows[0]
+}
+
+// UpsertMessage inserts or updates a message row (merge on message_id).
+func (s *SupabaseClient) UpsertMessage(msg DBMessage) error {
+	_, status, err := s.do("POST", "messages", msg,
+		map[string]string{
+			"Prefer": "resolution=merge-duplicates,return=minimal",
+		})
+	if err != nil {
+		return err
+	}
+	if status >= 300 {
+		return fmt.Errorf("supabase upsert failed: status %d", status)
+	}
+	return nil
+}
+
+// AppendReply updates reply columns on the root message row.
+func (s *SupabaseClient) AppendReply(rootID, name, phone, replyText string) error {
+	root := s.GetMessage(rootID)
+	if root == nil {
+		return fmt.Errorf("root message %s not found in supabase", rootID)
+	}
+	updatedNames := appendCSV(root.RepliedByNames, name)
+	updatedPhones := appendCSV(root.RepliedByPhones, phone)
+	updatedReplies := appendCSV(root.Replies, replyText)
+
+	patch := map[string]string{
+		"reply_status":      "Replied",
+		"replied_by_names":  updatedNames,
+		"replied_by_phones": updatedPhones,
+		"replies":           updatedReplies,
+	}
+	_, status, err := s.do("PATCH", "messages?message_id=eq."+rootID, patch,
+		map[string]string{"Prefer": "return=minimal"})
+	if err != nil {
+		return err
+	}
+	if status >= 300 {
+		return fmt.Errorf("supabase patch failed: status %d", status)
+	}
+	return nil
+}
+
+// AllNotReplied returns all messages with reply_status = 'Not Replied'.
+func (s *SupabaseClient) AllNotReplied() []DBMessage {
+	b, status, err := s.do("GET", "messages?reply_status=eq.Not+Replied&select=*", nil, nil)
+	if err != nil || status != 200 {
+		return nil
+	}
+	var rows []DBMessage
+	json.Unmarshal(b, &rows)
+	return rows
+}
+
+// AllSeenIDs returns all message_ids from the seen_ids table.
+func (s *SupabaseClient) AllSeenIDs() []string {
+	b, status, err := s.do("GET", "seen_ids?select=message_id", nil, nil)
+	if err != nil || status != 200 {
+		return nil
+	}
+	var rows []map[string]string
+	json.Unmarshal(b, &rows)
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if id := r["message_id"]; id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // ── Agent ──────────────────────────────────────────────────────────────────────
 type Agent struct {
 	client     *whatsmeow.Client
-	groupCache sync.Map // JID string -> group name
-	seenIDs    sync.Map // message ID -> bool (dedup)
+	groupCache sync.Map // JID string -> group name (kept in-memory, cheap)
 	sheetsvc   *sheets.Service
 	sheetID    string
 	sheetName  string
 	queue      chan Record
 	log        waLog.Logger
-	// pendingRoots holds group messages that have not yet been replied to.
-	// These are cached so that when a reply arrives we can create the row
-	// with the original message details instead of using the reply as the root.
-	pendingRoots sync.Map // message ID -> Record
-	// myPhone and myName identify the linked device owner so that messages
-	// sent by the linked phone (IsFromMe) appear with the correct name/number.
-	myPhone string
-	myName  string
+	db         *SupabaseClient
+	myPhone    string
+	myName     string
 }
 
-func newAgent(client *whatsmeow.Client, svc *sheets.Service, sheetID, sheetName string, log waLog.Logger) *Agent {
+func newAgent(client *whatsmeow.Client, svc *sheets.Service, sheetID, sheetName string, db *SupabaseClient, log waLog.Logger) *Agent {
 	return &Agent{
-		client:       client,
-		sheetsvc:     svc,
-		sheetID:      sheetID,
-		sheetName:    sheetName,
-		queue:        make(chan Record, 512),
-		log:          log,
-		pendingRoots: sync.Map{},
-		myPhone:      "14699816010", // +1(469)981-6010 — digits only, no + or spaces
-		myName:       "P.E Team",
+		client:    client,
+		sheetsvc:  svc,
+		sheetID:   sheetID,
+		sheetName: sheetName,
+		queue:     make(chan Record, 512),
+		log:       log,
+		db:        db,
+		myPhone:   "14699816010",
+		myName:    "P.E Team",
 	}
 }
 
-// ── Group name resolver (cached) ──────────────────────────────────────────────
+// ── Group name resolver ────────────────────────────────────────────────────────
 func (a *Agent) groupName(jid types.JID) string {
 	key := jid.String()
 	if v, ok := a.groupCache.Load(key); ok {
@@ -113,9 +272,8 @@ func (a *Agent) groupName(jid types.JID) string {
 	return jid.User
 }
 
-// ── Sender phone resolver ─────────────────────────────────────────────────────
+// ── Sender phone resolver ──────────────────────────────────────────────────────
 func senderPhone(v *events.Message) string {
-	// SenderAlt carries the phone number JID when addressing mode is LID
 	if v.Info.SenderAlt.Server == "s.whatsapp.net" && v.Info.SenderAlt.User != "" {
 		return v.Info.SenderAlt.User
 	}
@@ -179,7 +337,7 @@ func extractText(msg *waE2E.Message) (msgType, text string) {
 	return "other", ""
 }
 
-// ── Context info extractor (works across all message types) ──────────────────
+// ── Context info extractor ────────────────────────────────────────────────────
 func contextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
 	if msg == nil {
 		return nil
@@ -212,48 +370,39 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 		fmt.Println("[Agent] Logged out from phone — restart the agent to reconnect.")
 
 	case *events.Message:
-		// Group messages only
 		if !v.Info.IsGroup {
 			return
 		}
-		// Skip edits, revokes, protocol messages
 		if v.Info.Edit != "" {
 			return
 		}
-		// Dedup
-		if _, seen := a.seenIDs.LoadOrStore(v.Info.ID, true); seen {
-			return
+
+		// ── Dedup via Supabase ────────────────────────────────────────────
+		if a.db.MarkSeen(v.Info.ID) {
+			return // already processed
 		}
 
 		msgType, msgText := extractText(v.Message)
 		if msgText == "" {
-			return // skip media-only or unsupported with no text
+			return
 		}
 
-		// Reply threading
 		var replyMsgID string
 		var isReply bool
 		var quotedText, quotedSenderName, quotedSenderPhone string
 		if ci := contextInfo(v.Message); ci != nil && ci.GetQuotedMessage() != nil {
 			isReply = true
 			replyMsgID = ci.GetStanzaID()
-			// Extract quoted/original message text so we can populate the root row later if needed
 			qMsgType, qMsgText := extractText(ci.GetQuotedMessage())
-			// Use only textual quotes; ignore attachments that have no caption
 			if qMsgType != "unknown" && qMsgText != "" {
 				quotedText = qMsgText
 			}
-			// Extract original sender from ContextInfo.Participant (always a phone JID like 923001234567@s.whatsapp.net)
 			if participant := ci.GetParticipant(); participant != "" {
-				// Participant is a full JID; strip the server suffix to get the phone number
 				quotedSenderPhone = strings.Split(participant, "@")[0]
-				// ContextInfo has no PushName field — use the phone number as the name.
-				// The real name will be present if the root message was cached in pendingRoots.
 				quotedSenderName = quotedSenderPhone
 			}
 		}
 
-		// Thread ID: root of the thread
 		threadID := v.Info.ID
 		if replyMsgID != "" {
 			threadID = replyMsgID
@@ -261,8 +410,6 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 
 		name := v.Info.PushName
 		phone := senderPhone(v)
-		// For messages sent from the linked phone, PushName and Sender are
-		// empty — use the hardcoded owner identity instead.
 		if v.Info.IsFromMe {
 			phone = a.myPhone
 			name = a.myName
@@ -297,13 +444,20 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 	}
 }
 
-// ── Sheet helpers ──────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 func cellStr(v interface{}) string {
 	if v == nil {
 		return ""
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func safeIdx(row []interface{}, i int) string {
+	if i < len(row) {
+		return fmt.Sprintf("%v", row[i])
+	}
+	return ""
 }
 
 func appendCSV(existing, val string) string {
@@ -313,25 +467,45 @@ func appendCSV(existing, val string) string {
 	return existing + ", " + val
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func makeSummary(msg string) string {
+	runes := []rune(msg)
+	if len(runes) > 80 {
+		return string(runes[:80]) + "..."
 	}
-	return b
+	return msg
 }
 
-// ensureHeaders writes the header row if not already present.
+func recordToDBMessage(rec Record, replyStatus string) DBMessage {
+	return DBMessage{
+		MessageID:   rec.MessageID,
+		ThreadID:    rec.ThreadID,
+		GroupName:   rec.GroupName,
+		GroupJID:    rec.GroupJID,
+		SenderName:  rec.SenderName,
+		SenderPhone: rec.SenderPhone,
+		MessageType: rec.MessageType,
+		Message:     rec.Message,
+		Summary:     makeSummary(rec.Message),
+		DateSent:    rec.Date,
+		ReplyStatus: replyStatus,
+	}
+}
+
+// ── Sheet helpers ──────────────────────────────────────────────────────────────
+
 func (a *Agent) ensureHeaders() {
-	// Adjust range to the length of new headers (A to M).
-	rangeStr := a.sheetName + "!A1:M1"
+	rangeStr := a.sheetName + "!A1:N1"
 	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, rangeStr).Do()
-	if err != nil || len(resp.Values) == 0 {
+	needsHeaders := err != nil ||
+		len(resp.Values) == 0 ||
+		len(resp.Values[0]) == 0 ||
+		fmt.Sprintf("%v", resp.Values[0][0]) == ""
+	if needsHeaders {
 		vr := &sheets.ValueRange{Values: [][]interface{}{sheetHeaders}}
 		_, _ = a.sheetsvc.Spreadsheets.Values.Update(a.sheetID, rangeStr, vr).
 			ValueInputOption("RAW").Do()
 	}
 
-	// Apply formatting: freeze header row and set bold grey background.
 	spreadsheet, err2 := a.sheetsvc.Spreadsheets.Get(a.sheetID).Fields("sheets.properties").Do()
 	if err2 == nil {
 		var sid int64 = -1
@@ -342,74 +516,48 @@ func (a *Agent) ensureHeaders() {
 			}
 		}
 		if sid >= 0 {
-			// Build batch update requests to style the header row and set column widths.
 			reqs := []*sheets.Request{
 				{
 					UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
 						Properties: &sheets.SheetProperties{
-							SheetId: sid,
-							GridProperties: &sheets.GridProperties{
-								FrozenRowCount: 1,
-							},
+							SheetId:        sid,
+							GridProperties: &sheets.GridProperties{FrozenRowCount: 1},
 						},
 						Fields: "gridProperties.frozenRowCount",
 					},
 				},
 				{
-					// Set row height for the header row to give breathing space
 					UpdateDimensionProperties: &sheets.UpdateDimensionPropertiesRequest{
 						Range: &sheets.DimensionRange{
-							SheetId:    sid,
-							Dimension:  "ROWS",
-							StartIndex: 0,
-							EndIndex:   1,
+							SheetId: sid, Dimension: "ROWS", StartIndex: 0, EndIndex: 1,
 						},
-						Properties: &sheets.DimensionProperties{
-							PixelSize: 32,
-						},
-						Fields: "pixelSize",
+						Properties: &sheets.DimensionProperties{PixelSize: 32},
+						Fields:     "pixelSize",
 					},
 				},
 				{
-					// Set column widths to a uniform size for better readability
 					UpdateDimensionProperties: &sheets.UpdateDimensionPropertiesRequest{
 						Range: &sheets.DimensionRange{
-							SheetId:    sid,
-							Dimension:  "COLUMNS",
-							StartIndex: 0,
-							EndIndex:   int64(len(sheetHeaders)),
+							SheetId: sid, Dimension: "COLUMNS",
+							StartIndex: 0, EndIndex: int64(len(sheetHeaders)),
 						},
-						Properties: &sheets.DimensionProperties{
-							PixelSize: 160,
-						},
-						Fields: "pixelSize",
+						Properties: &sheets.DimensionProperties{PixelSize: 160},
+						Fields:     "pixelSize",
 					},
 				},
 				{
-					// Apply dark blue background, white bold text and centering to header row
 					RepeatCell: &sheets.RepeatCellRequest{
 						Range: &sheets.GridRange{
-							SheetId:          sid,
-							StartRowIndex:    0,
-							EndRowIndex:      1,
-							StartColumnIndex: 0,
-							EndColumnIndex:   int64(len(sheetHeaders)),
+							SheetId: sid, StartRowIndex: 0, EndRowIndex: 1,
+							StartColumnIndex: 0, EndColumnIndex: int64(len(sheetHeaders)),
 						},
 						Cell: &sheets.CellData{
 							UserEnteredFormat: &sheets.CellFormat{
-								BackgroundColor: &sheets.Color{
-									Red:   0.17,
-									Green: 0.45,
-									Blue:  0.71,
-								},
+								BackgroundColor: &sheets.Color{Red: 0.17, Green: 0.45, Blue: 0.71},
 								TextFormat: &sheets.TextFormat{
-									Bold: true,
-									ForegroundColor: &sheets.Color{
-										Red:   1.0,
-										Green: 1.0,
-										Blue:  1.0,
-									},
-									FontSize: 12,
+									Bold:            true,
+									ForegroundColor: &sheets.Color{Red: 1.0, Green: 1.0, Blue: 1.0},
+									FontSize:        12,
 								},
 								HorizontalAlignment: "CENTER",
 								VerticalAlignment:   "MIDDLE",
@@ -426,8 +574,6 @@ func (a *Agent) ensureHeaders() {
 	}
 }
 
-// findRowByMessageID searches column B for the given message ID.
-// Returns 1-based row number or -1 if not found.
 func (a *Agent) findRowByMessageID(msgID string) (int, error) {
 	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, a.sheetName+"!B:B").Do()
 	if err != nil {
@@ -435,229 +581,159 @@ func (a *Agent) findRowByMessageID(msgID string) (int, error) {
 	}
 	for i, row := range resp.Values {
 		if len(row) > 0 && cellStr(row[0]) == msgID {
-			return i + 1, nil // 1-based
+			return i + 1, nil
 		}
 	}
 	return -1, nil
 }
 
-// appendReply finds the original message row and appends the reply info into
-// columns J (Reply Status), K (Replied By Names), L (Replied By Phones), M (Replies).
-func (a *Agent) appendReply(rec Record) {
+func (a *Agent) nextSN() int {
+	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, a.sheetName+"!A:A").Do()
+	if err == nil && len(resp.Values) > 0 {
+		return len(resp.Values)
+	}
+	return 1
+}
+
+// appendNewRow writes a brand-new root message row to the sheet.
+func (a *Agent) appendNewRow(rec Record, replyStatus string, repliedByName, repliedByPhone, replies string) {
+	sn := a.nextSN()
+	row := []interface{}{
+		strconv.Itoa(sn),
+		rec.MessageID,
+		rec.SenderName,
+		rec.SenderPhone,
+		rec.GroupName,
+		rec.GroupJID,
+		rec.Date,
+		makeSummary(rec.Message),
+		rec.Message,
+		rec.MessageType,
+		replyStatus,
+		repliedByName,
+		repliedByPhone,
+		replies,
+	}
+	vr := &sheets.ValueRange{Values: [][]interface{}{row}}
+	_, err := a.sheetsvc.Spreadsheets.Values.Append(a.sheetID, a.sheetName+"!A1", vr).
+		ValueInputOption("USER_ENTERED").
+		InsertDataOption("INSERT_ROWS").
+		Do()
+	if err != nil {
+		fmt.Printf("[ERROR] Sheet append failed: %v\n", err)
+	}
+}
+
+// updateReplyInSheet updates reply columns K:N for an existing sheet row.
+func (a *Agent) updateReplyInSheet(rowNum int, names, phones, replies string) {
+	rangeStr := fmt.Sprintf("%s!K%d:N%d", a.sheetName, rowNum, rowNum)
+	vr := &sheets.ValueRange{
+		Values: [][]interface{}{{"Replied", names, phones, replies}},
+	}
+	_, err := a.sheetsvc.Spreadsheets.Values.Update(a.sheetID, rangeStr, vr).
+		ValueInputOption("USER_ENTERED").Do()
+	if err != nil {
+		fmt.Printf("[ERROR] Reply update failed: %v\n", err)
+	}
+}
+
+// ── Core write logic ───────────────────────────────────────────────────────────
+
+func (a *Agent) writeToSheet(rec Record) {
+	if !rec.IsReply {
+		// ── Root message ──────────────────────────────────────────────────
+		// Save to Supabase immediately (source of truth).
+		// Do NOT write to sheet yet — wait until a reply comes in.
+		// (Same behaviour as before, but now persisted in Supabase.)
+		dbMsg := recordToDBMessage(rec, "Not Replied")
+		if err := a.db.UpsertMessage(dbMsg); err != nil {
+			fmt.Printf("[ERROR] Supabase upsert failed: %v\n", err)
+		}
+		fmt.Printf("[%s %s] %s | CACHED: %s (%s): %s\n",
+			rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.SenderPhone, rec.Message)
+		return
+	}
+
+	// ── Reply message ─────────────────────────────────────────────────────
+	root := a.db.GetMessage(rec.RepliedToMessageID)
+	if root == nil {
+		// Root not in Supabase — create a placeholder using ContextInfo data.
+		rootSenderName := rec.QuotedSenderName
+		if rootSenderName == "" {
+			rootSenderName = rec.QuotedSenderPhone
+		}
+		if rootSenderName == "" {
+			rootSenderName = "Unknown"
+		}
+		msgText := rec.QuotedMessage
+		root = &DBMessage{
+			MessageID:   rec.RepliedToMessageID,
+			ThreadID:    rec.RepliedToMessageID,
+			GroupName:   rec.GroupName,
+			GroupJID:    rec.GroupJID,
+			SenderName:  rootSenderName,
+			SenderPhone: rec.QuotedSenderPhone,
+			MessageType: rec.MessageType,
+			Message:     msgText,
+			Summary:     makeSummary(msgText),
+			DateSent:    rec.Date,
+			ReplyStatus: "Not Replied",
+		}
+		// Mark the placeholder as seen so we don't create it again
+		a.db.MarkSeen(rec.RepliedToMessageID)
+		if err := a.db.UpsertMessage(*root); err != nil {
+			fmt.Printf("[ERROR] Supabase placeholder upsert failed: %v\n", err)
+		}
+	}
+
+	// Update Supabase reply fields
+	if err := a.db.AppendReply(rec.RepliedToMessageID, rec.SenderName, rec.SenderPhone, rec.Message); err != nil {
+		fmt.Printf("[ERROR] Supabase AppendReply failed: %v\n", err)
+	}
+
+	// Now sync to Google Sheet
 	rowNum, err := a.findRowByMessageID(rec.RepliedToMessageID)
 	if err != nil {
 		fmt.Printf("[ERROR] Sheet search failed: %v\n", err)
 		return
 	}
+
+	// Re-fetch updated root from Supabase (has the merged reply data)
+	updatedRoot := a.db.GetMessage(rec.RepliedToMessageID)
+
 	if rowNum == -1 {
-		// If the original message isn't recorded yet, handle accordingly.
-		// If we've already created a root row (seenIDs has the ID) but the row isn't visible yet,
-		// skip to avoid infinite recursion. It will be updated in a subsequent run.
-		if _, exists := a.seenIDs.Load(rec.RepliedToMessageID); exists {
-			fmt.Printf("[WARN] Row for original msg %s not yet available in sheet, skipping reply for now\n", rec.RepliedToMessageID)
-			return
+		// Root row doesn't exist in sheet yet — write it now with reply data embedded
+		rootRec := Record{
+			MessageID:   root.MessageID,
+			GroupName:   root.GroupName,
+			GroupJID:    root.GroupJID,
+			SenderName:  root.SenderName,
+			SenderPhone: root.SenderPhone,
+			MessageType: root.MessageType,
+			Message:     root.Message,
+			Date:        root.DateSent,
 		}
-		// Try using cached root details, otherwise create a minimal placeholder.
-		if val, ok := a.pendingRoots.Load(rec.RepliedToMessageID); ok {
-			root := val.(Record)
-			a.appendNewRootWithReply(root, rec)
-		} else {
-			fmt.Printf("[WARN] Original msg %s not found in sheet or cache, writing reply using reply info\n", rec.RepliedToMessageID)
-			// Build root from ContextInfo data extracted in handleEvent (QuotedSenderName/Phone).
-			// This fixes the "Unknown" sender problem for old messages not in the agent's cache.
-			rootSenderName := rec.QuotedSenderName
-			if rootSenderName == "" {
-				rootSenderName = rec.QuotedSenderPhone
-			}
-			if rootSenderName == "" {
-				rootSenderName = "Unknown"
-			}
-			a.appendNewRootWithReply(Record{
-				MessageID:   rec.RepliedToMessageID,
-				ThreadID:    rec.RepliedToMessageID,
-				GroupName:   rec.GroupName,
-				GroupJID:    rec.GroupJID,
-				SenderName:  rootSenderName,
-				SenderPhone: rec.QuotedSenderPhone,
-				MessageType: rec.MessageType,
-				Message:     "", // will be replaced by quoted message if available
-				Date:        rec.Date,
-				Time:        rec.Time,
-			}, rec)
+		names, phones, replies := "", "", ""
+		if updatedRoot != nil {
+			names = updatedRoot.RepliedByNames
+			phones = updatedRoot.RepliedByPhones
+			replies = updatedRoot.Replies
 		}
-		return
-	}
-
-	// Read current J:M values (Reply Status, Replied By Names, Replied By Phones, Replies)
-	rangeStr := fmt.Sprintf("%s!J%d:M%d", a.sheetName, rowNum, rowNum)
-	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, rangeStr).Do()
-
-	var existingStatus, existingNames, existingPhones, existingReplies string
-	if err == nil && len(resp.Values) > 0 {
-		row := resp.Values[0]
-		if len(row) > 0 {
-			existingStatus = cellStr(row[0])
-		}
-		if len(row) > 1 {
-			existingNames = cellStr(row[1])
-		}
-		if len(row) > 2 {
-			existingPhones = cellStr(row[2])
-		}
-		if len(row) > 3 {
-			existingReplies = cellStr(row[3])
-		}
-	}
-	_ = existingStatus
-
-	updatedNames := appendCSV(existingNames, rec.SenderName)
-	updatedPhones := appendCSV(existingPhones, rec.SenderPhone)
-	updatedReplies := appendCSV(existingReplies, rec.Message)
-	vr := &sheets.ValueRange{
-		Values: [][]interface{}{{
-			"Replied",
-			updatedNames,
-			updatedPhones,
-			updatedReplies,
-		}},
-	}
-	_, err = a.sheetsvc.Spreadsheets.Values.Update(a.sheetID, rangeStr, vr).
-		ValueInputOption("USER_ENTERED").Do()
-	if err != nil {
-		fmt.Printf("[ERROR] Reply update failed: %v\n", err)
-		return
-	}
-	fmt.Printf("[%s %s] %s | REPLY by %s (%s) → \"%s\"\n",
-		rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.SenderPhone, rec.Message)
-}
-
-// appendNewRow writes a brand-new message as a new sheet row.
-// Column order: SN | Sender Name | Sender Phone | Group Name | Group JID |
-//
-//	Date Sent | Message Summary | Message | Type |
-//	Reply Status | Replied By Names | Replied By Phones | Replies
-func (a *Agent) appendNewRow(rec Record) {
-	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, a.sheetName+"!A:A").Do()
-	sn := 1
-	if err == nil && len(resp.Values) > 0 {
-		sn = len(resp.Values)
-	}
-
-	// Message Summary: first 80 chars of the message text (like the Email Summary column in the sample)
-	summary := rec.Message
-	if len([]rune(summary)) > 80 {
-		runes := []rune(summary)
-		summary = string(runes[:80]) + "..."
-	}
-
-	row := []interface{}{
-		strconv.Itoa(sn), // A: SN
-		rec.SenderName,   // B: Sender Name
-		rec.SenderPhone,  // C: Sender Phone
-		rec.GroupName,    // D: Group Name
-		rec.GroupJID,     // E: Group JID
-		rec.Date,         // F: Date Sent
-		summary,          // G: Message Summary
-		rec.Message,      // H: Message (full)
-		rec.MessageType,  // I: Type
-		"Not Replied",    // J: Reply Status
-		"",               // K: Replied By Names
-		"",               // L: Replied By Phones
-		"",               // M: Replies
-	}
-
-	vr := &sheets.ValueRange{Values: [][]interface{}{row}}
-	_, err = a.sheetsvc.Spreadsheets.Values.Append(a.sheetID, a.sheetName+"!A1", vr).
-		ValueInputOption("USER_ENTERED").
-		InsertDataOption("INSERT_ROWS").
-		Do()
-	if err != nil {
-		fmt.Printf("[ERROR] Sheet append failed: %v\n", err)
-		return
-	}
-
-	fmt.Printf("[%s %s] %s | %s (%s): %s\n",
-		rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.SenderPhone, rec.Message)
-}
-
-// appendNewRootWithReply writes a new row for a root message together with the first reply.
-// It sets the row as replied and populates the first reply details. This is used when
-// a reply arrives for a message whose root has not been recorded yet. The root details
-// come from either the pending cache or from a minimal placeholder.
-func (a *Agent) appendNewRootWithReply(root Record, reply Record) {
-	// Avoid duplicates: if the message ID already exists, simply append the reply.
-	if _, exists := a.seenIDs.Load(root.MessageID); exists {
-		// Do not attempt to append a new root again. Instead, call appendReply once.
-		a.appendReply(reply)
-		return
-	}
-	// Determine the next serial number (SN)
-	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, a.sheetName+"!A:A").Do()
-	sn := 1
-	if err == nil && len(resp.Values) > 0 {
-		sn = len(resp.Values)
-	}
-	// Compose the row. If the root message text is empty, but the reply record contains
-	// a quoted/original message, use that quoted text as the message. This ensures
-	// that when a reply arrives for an old message not seen before, the original
-	// message appears in the "Message" column.
-	messageText := root.Message
-	if messageText == "" && reply.QuotedMessage != "" {
-		messageText = reply.QuotedMessage
-	}
-
-	// Message Summary: first 80 chars
-	summary := messageText
-	if len([]rune(summary)) > 80 {
-		runes := []rune(summary)
-		summary = string(runes[:80]) + "..."
-	}
-
-	row := []interface{}{
-		strconv.Itoa(sn),  // A: SN
-		root.SenderName,   // B: Sender Name
-		root.SenderPhone,  // C: Sender Phone
-		root.GroupName,    // D: Group Name
-		root.GroupJID,     // E: Group JID
-		root.Date,         // F: Date Sent
-		summary,           // G: Message Summary
-		messageText,       // H: Message (full)
-		root.MessageType,  // I: Type
-		"Replied",         // J: Reply Status
-		reply.SenderName,  // K: Replied By Names
-		reply.SenderPhone, // L: Replied By Phones
-		reply.Message,     // M: Replies
-	}
-	vr := &sheets.ValueRange{Values: [][]interface{}{row}}
-	// Mark as seen before writing to prevent concurrent duplicate creation
-	a.seenIDs.Store(root.MessageID, true)
-
-	_, err = a.sheetsvc.Spreadsheets.Values.Append(a.sheetID, a.sheetName+"!A1", vr).
-		ValueInputOption("USER_ENTERED").
-		InsertDataOption("INSERT_ROWS").
-		Do()
-	if err != nil {
-		fmt.Printf("[ERROR] Sheet append failed: %v\n", err)
-		return
-	}
-	fmt.Printf("[%s %s] %s | NEW THREAD: %s (%s) replied by %s (%s) → \"%s\"\n",
-		reply.Date, reply.Time, root.GroupName, root.SenderName, root.SenderPhone,
-		reply.SenderName, reply.SenderPhone, messageText)
-}
-
-func (a *Agent) writeToSheet(rec Record) {
-	if rec.IsReply {
-		a.appendReply(rec)
-		// Also cache this reply record so that if someone replies to it later,
-		// we have the correct sender name and phone available (fixes nested reply name issue).
-		if _, exists := a.seenIDs.Load(rec.MessageID); !exists {
-			a.pendingRoots.Store(rec.MessageID, rec)
-		}
+		a.appendNewRow(rootRec, "Replied", names, phones, replies)
+		fmt.Printf("[%s %s] %s | NEW THREAD: %s (%s) replied by %s (%s) → \"%s\"\n",
+			rec.Date, rec.Time, root.GroupName, root.SenderName, root.SenderPhone,
+			rec.SenderName, rec.SenderPhone, rec.Message)
 	} else {
-		// Cache non-reply messages until they receive replies. Do not write them immediately.
-		if _, exists := a.seenIDs.Load(rec.MessageID); !exists {
-			a.pendingRoots.Store(rec.MessageID, rec)
+		// Row exists — update the reply columns only
+		names, phones, replies := rec.SenderName, rec.SenderPhone, rec.Message
+		if updatedRoot != nil {
+			names = updatedRoot.RepliedByNames
+			phones = updatedRoot.RepliedByPhones
+			replies = updatedRoot.Replies
 		}
+		a.updateReplyInSheet(rowNum, names, phones, replies)
+		fmt.Printf("[%s %s] %s | REPLY by %s (%s) → \"%s\"\n",
+			rec.Date, rec.Time, rec.GroupName, rec.SenderName, rec.SenderPhone, rec.Message)
 	}
 }
 
@@ -733,42 +809,34 @@ func main() {
 		fmt.Println("GOOGLE_SHEET_ID is not set in .env")
 		os.Exit(1)
 	}
-
 	svc, err := newSheetsService(ctx, credPath)
 	if err != nil {
 		fmt.Printf("Google Sheets init error: %v\n", err)
 		os.Exit(1)
 	}
 
-	agent := newAgent(client, svc, sheetID, sheetName, log)
-	agent.ensureHeaders()
-	// Preload existing message IDs from the sheet so that previously recorded
-	// messages are not processed again on restart. We read column B (Message ID)
-	// starting from the second row and populate the seenIDs map.
-	func() {
-		// In a closure to limit scope of err/res variables
-		resp, err := svc.Spreadsheets.Values.Get(sheetID, sheetName+"!B2:B").Do()
-		if err == nil {
-			for _, row := range resp.Values {
-				if len(row) > 0 {
-					id := fmt.Sprintf("%v", row[0])
-					if id != "" {
-						agent.seenIDs.Store(id, true)
-					}
-				}
-			}
-		}
-	}()
+	// Supabase
+	supabaseURL := strings.TrimSpace(os.Getenv("SUPABASE_URL"))
+	supabaseKey := strings.TrimSpace(os.Getenv("SUPABASE_SERVICE_ROLE_KEY"))
+	if supabaseURL == "" || supabaseKey == "" {
+		fmt.Println("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env")
+		os.Exit(1)
+	}
+	db := newSupabaseClient(supabaseURL, supabaseKey)
 
-	client.AddEventHandler(agent.handleEvent)
-	go agent.runWriter(ctx)
+	agent := newAgent(client, svc, sheetID, sheetName, db, log)
+	agent.ensureHeaders()
 
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println(" WhatsApp Group CRM Agent starting...")
-	fmt.Printf(" Sheet : %s (ID: %s)\n", sheetName, sheetID)
-	fmt.Println(" Scope : Group messages only")
+	fmt.Printf(" Sheet     : %s (ID: %s)\n", sheetName, sheetID)
+	fmt.Printf(" Supabase  : %s\n", supabaseURL)
+	fmt.Println(" Scope     : Group messages only")
 	fmt.Println(" Press CTRL+C to stop")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	client.AddEventHandler(agent.handleEvent)
+	go agent.runWriter(ctx)
 
 	if err = client.Connect(); err != nil {
 		fmt.Printf("connect error: %v\n", err)
