@@ -363,6 +363,11 @@ func contextInfo(msg *waE2E.Message) *waE2E.ContextInfo {
 // ── Event handler ──────────────────────────────────────────────────────────────
 func (a *Agent) handleEvent(rawEvt interface{}) {
 	switch v := rawEvt.(type) {
+	case *events.HistorySync:
+		// Drop history sync events immediately — we only care about live messages.
+		// Processing history sync is the #1 cause of OOM on low-memory servers.
+		_ = v
+		return
 	case *events.Connected:
 		fmt.Println("[Agent] Connected to WhatsApp servers.")
 		fmt.Printf("[Agent] Linked as: %s (%s)\n", a.myName, a.myPhone)
@@ -790,6 +795,8 @@ func main() {
 		os.Exit(1)
 	}
 	client := whatsmeow.NewClient(deviceStore, log)
+	client.EmitAppStateEventsOnFullSync = false
+	client.AutomaticMessageRerequestFromPhone = false
 	if client.Store.ID == nil {
 		fmt.Println("No linked account. Run `go run ./cmd/link` first.")
 		os.Exit(1)

@@ -24,38 +24,40 @@ func main() {
 	flag.Parse()
 
 	dbPath := strings.TrimSpace(os.Getenv("WHATSAPP_DB_PATH"))
-if dbPath == "" {
-dbPath = "./data/whatsapp.db"
-}
+	if dbPath == "" {
+		dbPath = "./data/whatsapp.db"
+	}
 
-if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-fmt.Printf("failed to create db directory: %v\n", err)
-os.Exit(1)
-}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		fmt.Printf("failed to create db directory: %v\n", err)
+		os.Exit(1)
+	}
 
-absDBPath, err := filepath.Abs(dbPath)
-if err != nil {
-fmt.Printf("failed to resolve db path: %v\n", err)
-os.Exit(1)
-}
+	absDBPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		fmt.Printf("failed to resolve db path: %v\n", err)
+		os.Exit(1)
+	}
 
-// WAL mode is crucial for sqlite with whatsmeow to prevent locks during heavy initial history sync
-dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", filepath.ToSlash(absDBPath))
-log := waLog.Stdout("WhatsApp", "INFO", true)
+	// WAL mode is crucial for sqlite with whatsmeow to prevent locks during heavy initial history sync
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", filepath.ToSlash(absDBPath))
+	log := waLog.Stdout("WhatsApp", "INFO", true)
 
-container, err := sqlstore.New(context.Background(), "sqlite", dsn, log)
-if err != nil {
-fmt.Printf("failed to initialize sqlstore: %v\n", err)
-os.Exit(1)
-}
+	container, err := sqlstore.New(context.Background(), "sqlite", dsn, log)
+	if err != nil {
+		fmt.Printf("failed to initialize sqlstore: %v\n", err)
+		os.Exit(1)
+	}
 
-deviceStore, err := container.GetFirstDevice(context.Background())
-if err != nil {
-fmt.Printf("failed to get device store: %v\n", err)
-os.Exit(1)
-}
+	deviceStore, err := container.GetFirstDevice(context.Background())
+	if err != nil {
+		fmt.Printf("failed to get device store: %v\n", err)
+		os.Exit(1)
+	}
 
-client := whatsmeow.NewClient(deviceStore, log)
+	client := whatsmeow.NewClient(deviceStore, log)
+	client.EmitAppStateEventsOnFullSync = false
+	client.AutomaticMessageRerequestFromPhone = false
 
 	if client.Store.ID == nil {
 		fmt.Println("No linked account found. Starting pairing...")
@@ -139,4 +141,5 @@ client := whatsmeow.NewClient(deviceStore, log)
 	<-c
 
 	fmt.Println("\nDisconnecting...")
-	client.Disconnect()}
+	client.Disconnect()
+}
