@@ -372,6 +372,8 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 		fmt.Printf("[Agent] Linked as: %s (%s)\n", a.myName, a.myPhone)
 	case *events.LoggedOut:
 		fmt.Println("[Agent] Logged out from phone — restart the agent to reconnect.")
+	case *events.Disconnected:
+		fmt.Println("[Agent] Disconnected from WhatsApp. Will attempt reconnect...")
 
 	case *events.Message:
 		if !v.Info.IsGroup {
@@ -927,12 +929,6 @@ func main() {
 	client.AddEventHandler(agent.handleEvent)
 	go agent.runWriter(ctx)
 
-	if err = client.Connect(); err != nil {
-		fmt.Printf("connect error: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Pre-warm group name cache to avoid blocking event handler on first message
 	// Pre-warm group name cache to avoid blocking event handler on first message
 	go func() {
 		time.Sleep(3 * time.Second) // wait for connection to stabilize
@@ -945,7 +941,18 @@ func main() {
 		}
 	}()
 
-	<-ctx.Done()
-	fmt.Println("\nShutting down...")
-	client.Disconnect()
+	// Auto-reconnect loop
+	for {
+		if err = client.Connect(); err != nil {
+			fmt.Printf("connect error: %v\n", err)
+		}
+		select {
+		case <-ctx.Done():
+			fmt.Println("\nShutting down...")
+			client.Disconnect()
+			return
+		case <-time.After(5 * time.Second):
+			fmt.Println("[Agent] Reconnecting to WhatsApp...")
+		}
+	}
 }

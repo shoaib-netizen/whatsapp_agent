@@ -1,8 +1,6 @@
 # Local environment and secrets
 .env
 service_account.json
-data/whatsapp.db
-data/whatsapp.db-shm
-data/whatsapp.db-wal
+
 
 
