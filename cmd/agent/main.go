@@ -34,7 +34,7 @@ var sheetHeaders = []interface{}{
 	"SN", "Message ID", "Sender Name", "Sender Phone",
 	"Group Name", "Group JID",
 	"Date Sent",
-	"Message",
+	"Message Summary", "Message", "Type",
 	"Reply Status",
 	"Replied By Names", "Replied By Phones", "Replies",
 }
@@ -47,6 +47,7 @@ type Record struct {
 	GroupJID           string
 	SenderName         string
 	SenderPhone        string
+	MessageType        string
 	Message            string
 	Date               string
 	Time               string
@@ -65,7 +66,9 @@ type DBMessage struct {
 	GroupJID        string `json:"group_jid"`
 	SenderName      string `json:"sender_name"`
 	SenderPhone     string `json:"sender_phone"`
+	MessageType     string `json:"message_type"`
 	Message         string `json:"message"`
+	Summary         string `json:"summary"`
 	DateSent        string `json:"date_sent"`
 	ReplyStatus     string `json:"reply_status"`
 	RepliedByNames  string `json:"replied_by_names"`
@@ -228,11 +231,10 @@ func (s *SupabaseClient) AllSeenIDs() []string {
 // ── Agent ──────────────────────────────────────────────────────────────────────
 type Agent struct {
 	client     *whatsmeow.Client
-	groupCache sync.Map
+	groupCache sync.Map // JID string -> group name (kept in-memory, cheap)
 	sheetsvc   *sheets.Service
 	sheetID    string
 	sheetName  string
-	sheetSID   int64
 	queue      chan Record
 	log        waLog.Logger
 	db         *SupabaseClient
@@ -246,7 +248,6 @@ func newAgent(client *whatsmeow.Client, svc *sheets.Service, sheetID, sheetName 
 		sheetsvc:  svc,
 		sheetID:   sheetID,
 		sheetName: sheetName,
-		sheetSID:  -1,
 		queue:     make(chan Record, 512),
 		log:       log,
 		db:        db,
@@ -386,7 +387,7 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 			return // already processed
 		}
 
-		_, msgText := extractText(v.Message)
+		msgType, msgText := extractText(v.Message)
 		if msgText == "" {
 			return
 		}
@@ -397,25 +398,13 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 		if ci := contextInfo(v.Message); ci != nil && ci.GetQuotedMessage() != nil {
 			isReply = true
 			replyMsgID = ci.GetStanzaID()
-			_, qMsgText := extractText(ci.GetQuotedMessage())
-			if qMsgText != "" {
+			qMsgType, qMsgText := extractText(ci.GetQuotedMessage())
+			if qMsgType != "unknown" && qMsgText != "" {
 				quotedText = qMsgText
 			}
 			if participant := ci.GetParticipant(); participant != "" {
 				quotedSenderPhone = strings.Split(participant, "@")[0]
-				participantJID, jidErr := types.ParseJID(participant)
-				if jidErr == nil {
-					contact, contactErr := a.client.Store.Contacts.GetContact(context.Background(), participantJID)
-					if contactErr == nil && contact.PushName != "" {
-						quotedSenderName = contact.PushName
-					} else if contactErr == nil && contact.FullName != "" {
-						quotedSenderName = contact.FullName
-					} else {
-						quotedSenderName = quotedSenderPhone
-					}
-				} else {
-					quotedSenderName = quotedSenderPhone
-				}
+				quotedSenderName = quotedSenderPhone
 			}
 		}
 
@@ -429,16 +418,9 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 		if v.Info.IsFromMe {
 			phone = a.myPhone
 			name = a.myName
-		} else if name == "" {
-			// PushName is empty — try contact store
-			contact, err := a.client.Store.Contacts.GetContact(context.Background(), v.Info.Sender)
-			if err == nil && contact.PushName != "" {
-				name = contact.PushName
-			} else if err == nil && contact.FullName != "" {
-				name = contact.FullName
-			} else {
-				name = phone // last resort
-			}
+		}
+		if name == "" {
+			name = phone
 		}
 
 		rec := Record{
@@ -448,6 +430,7 @@ func (a *Agent) handleEvent(rawEvt interface{}) {
 			GroupJID:           v.Info.Chat.String(),
 			SenderName:         name,
 			SenderPhone:        phone,
+			MessageType:        msgType,
 			Message:            msgText,
 			Date:               v.Info.Timestamp.Format("2006-01-02"),
 			Time:               v.Info.Timestamp.Format("15:04:05"),
@@ -475,11 +458,26 @@ func cellStr(v interface{}) string {
 	return fmt.Sprintf("%v", v)
 }
 
+func safeIdx(row []interface{}, i int) string {
+	if i < len(row) {
+		return fmt.Sprintf("%v", row[i])
+	}
+	return ""
+}
+
 func appendCSV(existing, val string) string {
 	if existing == "" {
 		return val
 	}
 	return existing + ", " + val
+}
+
+func makeSummary(msg string) string {
+	runes := []rune(msg)
+	if len(runes) > 80 {
+		return string(runes[:80]) + "..."
+	}
+	return msg
 }
 
 func recordToDBMessage(rec Record, replyStatus string) DBMessage {
@@ -490,7 +488,9 @@ func recordToDBMessage(rec Record, replyStatus string) DBMessage {
 		GroupJID:    rec.GroupJID,
 		SenderName:  rec.SenderName,
 		SenderPhone: rec.SenderPhone,
+		MessageType: rec.MessageType,
 		Message:     rec.Message,
+		Summary:     makeSummary(rec.Message),
 		DateSent:    rec.Date,
 		ReplyStatus: replyStatus,
 	}
@@ -499,9 +499,11 @@ func recordToDBMessage(rec Record, replyStatus string) DBMessage {
 // ── Sheet helpers ──────────────────────────────────────────────────────────────
 
 func (a *Agent) ensureHeaders() {
-	rangeStr := a.sheetName + "!A1:L1"
+	rangeStr := a.sheetName + "!A1:N1"
 	resp, err := a.sheetsvc.Spreadsheets.Values.Get(a.sheetID, rangeStr).Do()
-	needsHeaders := err != nil || len(resp.Values) == 0 || len(resp.Values[0]) == 0 ||
+	needsHeaders := err != nil ||
+		len(resp.Values) == 0 ||
+		len(resp.Values[0]) == 0 ||
 		fmt.Sprintf("%v", resp.Values[0][0]) == ""
 	if needsHeaders {
 		vr := &sheets.ValueRange{Values: [][]interface{}{sheetHeaders}}
@@ -509,123 +511,72 @@ func (a *Agent) ensureHeaders() {
 			ValueInputOption("RAW").Do()
 	}
 
-	spreadsheet, err2 := a.sheetsvc.Spreadsheets.Get(a.sheetID).Do()
-	if err2 != nil {
-		return
-	}
-	a.sheetSID = -1
-	for _, sh := range spreadsheet.Sheets {
-		if sh.Properties != nil && sh.Properties.Title == a.sheetName {
-			a.sheetSID = sh.Properties.SheetId
-			// Delete all existing conditional format rules to prevent duplicates on restart
-			for i := len(sh.ConditionalFormats) - 1; i >= 0; i-- {
-				_, _ = a.sheetsvc.Spreadsheets.BatchUpdate(a.sheetID, &sheets.BatchUpdateSpreadsheetRequest{
-					Requests: []*sheets.Request{
-						{
-							DeleteConditionalFormatRule: &sheets.DeleteConditionalFormatRuleRequest{
-								SheetId: a.sheetSID,
-								Index:   int64(i),
+	spreadsheet, err2 := a.sheetsvc.Spreadsheets.Get(a.sheetID).Fields("sheets.properties").Do()
+	if err2 == nil {
+		var sid int64 = -1
+		for _, sh := range spreadsheet.Sheets {
+			if sh.Properties != nil && sh.Properties.Title == a.sheetName {
+				sid = sh.Properties.SheetId
+				break
+			}
+		}
+		if sid >= 0 {
+			reqs := []*sheets.Request{
+				{
+					UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
+						Properties: &sheets.SheetProperties{
+							SheetId:        sid,
+							GridProperties: &sheets.GridProperties{FrozenRowCount: 1},
+						},
+						Fields: "gridProperties.frozenRowCount",
+					},
+				},
+				{
+					UpdateDimensionProperties: &sheets.UpdateDimensionPropertiesRequest{
+						Range: &sheets.DimensionRange{
+							SheetId: sid, Dimension: "ROWS", StartIndex: 0, EndIndex: 1,
+						},
+						Properties: &sheets.DimensionProperties{PixelSize: 32},
+						Fields:     "pixelSize",
+					},
+				},
+				{
+					UpdateDimensionProperties: &sheets.UpdateDimensionPropertiesRequest{
+						Range: &sheets.DimensionRange{
+							SheetId: sid, Dimension: "COLUMNS",
+							StartIndex: 0, EndIndex: int64(len(sheetHeaders)),
+						},
+						Properties: &sheets.DimensionProperties{PixelSize: 160},
+						Fields:     "pixelSize",
+					},
+				},
+				{
+					RepeatCell: &sheets.RepeatCellRequest{
+						Range: &sheets.GridRange{
+							SheetId: sid, StartRowIndex: 0, EndRowIndex: 1,
+							StartColumnIndex: 0, EndColumnIndex: int64(len(sheetHeaders)),
+						},
+						Cell: &sheets.CellData{
+							UserEnteredFormat: &sheets.CellFormat{
+								BackgroundColor: &sheets.Color{Red: 0.17, Green: 0.45, Blue: 0.71},
+								TextFormat: &sheets.TextFormat{
+									Bold:            true,
+									ForegroundColor: &sheets.Color{Red: 1.0, Green: 1.0, Blue: 1.0},
+									FontSize:        12,
+								},
+								HorizontalAlignment: "CENTER",
+								VerticalAlignment:   "MIDDLE",
 							},
 						},
+						Fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)",
 					},
-				}).Do()
+				},
 			}
-			break
+			_, _ = a.sheetsvc.Spreadsheets.BatchUpdate(a.sheetID, &sheets.BatchUpdateSpreadsheetRequest{
+				Requests: reqs,
+			}).Do()
 		}
 	}
-	if a.sheetSID < 0 {
-		return
-	}
-
-	sid := a.sheetSID
-	reqs := []*sheets.Request{
-		// Freeze header row
-		{
-			UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
-				Properties: &sheets.SheetProperties{
-					SheetId:        sid,
-					GridProperties: &sheets.GridProperties{FrozenRowCount: 1},
-				},
-				Fields: "gridProperties.frozenRowCount",
-			},
-		},
-		// Header row height
-		{
-			UpdateDimensionProperties: &sheets.UpdateDimensionPropertiesRequest{
-				Range: &sheets.DimensionRange{
-					SheetId: sid, Dimension: "ROWS", StartIndex: 0, EndIndex: 1,
-				},
-				Properties: &sheets.DimensionProperties{PixelSize: 32},
-				Fields:     "pixelSize",
-			},
-		},
-		// Column widths
-		{
-			UpdateDimensionProperties: &sheets.UpdateDimensionPropertiesRequest{
-				Range: &sheets.DimensionRange{
-					SheetId: sid, Dimension: "COLUMNS",
-					StartIndex: 0, EndIndex: int64(len(sheetHeaders)),
-				},
-				Properties: &sheets.DimensionProperties{PixelSize: 160},
-				Fields:     "pixelSize",
-			},
-		},
-		// Blue header row ONLY
-		{
-			RepeatCell: &sheets.RepeatCellRequest{
-				Range: &sheets.GridRange{
-					SheetId: sid, StartRowIndex: 0, EndRowIndex: 1,
-					StartColumnIndex: 0, EndColumnIndex: int64(len(sheetHeaders)),
-				},
-				Cell: &sheets.CellData{
-					UserEnteredFormat: &sheets.CellFormat{
-						BackgroundColor: &sheets.Color{Red: 0.17, Green: 0.45, Blue: 0.71},
-						TextFormat: &sheets.TextFormat{
-							Bold:            true,
-							ForegroundColor: &sheets.Color{Red: 1.0, Green: 1.0, Blue: 1.0},
-							FontSize:        12,
-						},
-						HorizontalAlignment: "CENTER",
-						VerticalAlignment:   "MIDDLE",
-					},
-				},
-				Fields: "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)",
-			},
-		},
-		// Green on col I ONLY when value = "Replied"
-		{
-			AddConditionalFormatRule: &sheets.AddConditionalFormatRuleRequest{
-				Rule: &sheets.ConditionalFormatRule{
-					Ranges: []*sheets.GridRange{
-						{
-							SheetId:          sid,
-							StartRowIndex:    1,
-							EndRowIndex:      10000,
-							StartColumnIndex: 8,
-							EndColumnIndex:   9,
-						},
-					},
-					BooleanRule: &sheets.BooleanRule{
-						Condition: &sheets.BooleanCondition{
-							Type:   "TEXT_EQ",
-							Values: []*sheets.ConditionValue{{UserEnteredValue: "Replied"}},
-						},
-						Format: &sheets.CellFormat{
-							BackgroundColor: &sheets.Color{Red: 0.72, Green: 0.88, Blue: 0.72},
-							TextFormat: &sheets.TextFormat{
-								Bold:            true,
-								ForegroundColor: &sheets.Color{Red: 0.13, Green: 0.37, Blue: 0.13},
-							},
-						},
-					},
-				},
-				Index: 0,
-			},
-		},
-	}
-	_, _ = a.sheetsvc.Spreadsheets.BatchUpdate(a.sheetID, &sheets.BatchUpdateSpreadsheetRequest{
-		Requests: reqs,
-	}).Do()
 }
 
 func (a *Agent) findRowByMessageID(msgID string) (int, error) {
@@ -660,7 +611,9 @@ func (a *Agent) appendNewRow(rec Record, replyStatus string, repliedByName, repl
 		rec.GroupName,
 		rec.GroupJID,
 		rec.Date,
+		makeSummary(rec.Message),
 		rec.Message,
+		rec.MessageType,
 		replyStatus,
 		repliedByName,
 		repliedByPhone,
@@ -673,45 +626,12 @@ func (a *Agent) appendNewRow(rec Record, replyStatus string, repliedByName, repl
 		Do()
 	if err != nil {
 		fmt.Printf("[ERROR] Sheet append failed: %v\n", err)
-		return
-	}
-
-	// Clear background on the new data row using cached sheetSID
-	// sn=1 means sheet row 2 = row index 1 (0-based)
-	if a.sheetSID >= 0 {
-		newRowIndex := int64(sn) // sn starts at 1, row index 1 = sheet row 2
-		_, _ = a.sheetsvc.Spreadsheets.BatchUpdate(a.sheetID, &sheets.BatchUpdateSpreadsheetRequest{
-			Requests: []*sheets.Request{
-				{
-					RepeatCell: &sheets.RepeatCellRequest{
-						Range: &sheets.GridRange{
-							SheetId:          a.sheetSID,
-							StartRowIndex:    newRowIndex,
-							EndRowIndex:      newRowIndex + 1,
-							StartColumnIndex: 0,
-							EndColumnIndex:   int64(len(sheetHeaders)),
-						},
-						Cell: &sheets.CellData{
-							UserEnteredFormat: &sheets.CellFormat{
-								BackgroundColor: &sheets.Color{Red: 1.0, Green: 1.0, Blue: 1.0},
-								TextFormat: &sheets.TextFormat{
-									Bold:            true,
-									FontSize:        10,
-									ForegroundColor: &sheets.Color{Red: 0.0, Green: 0.0, Blue: 0.0},
-								},
-							},
-						},
-						Fields: "userEnteredFormat(backgroundColor,textFormat)",
-					},
-				},
-			},
-		}).Do()
 	}
 }
 
 // updateReplyInSheet updates reply columns K:N for an existing sheet row.
 func (a *Agent) updateReplyInSheet(rowNum int, names, phones, replies string) {
-	rangeStr := fmt.Sprintf("%s!I%d:L%d", a.sheetName, rowNum, rowNum)
+	rangeStr := fmt.Sprintf("%s!K%d:N%d", a.sheetName, rowNum, rowNum)
 	vr := &sheets.ValueRange{
 		Values: [][]interface{}{{"Replied", names, phones, replies}},
 	}
@@ -758,7 +678,9 @@ func (a *Agent) writeToSheet(rec Record) {
 			GroupJID:    rec.GroupJID,
 			SenderName:  rootSenderName,
 			SenderPhone: rec.QuotedSenderPhone,
+			MessageType: rec.MessageType,
 			Message:     msgText,
+			Summary:     makeSummary(msgText),
 			DateSent:    rec.Date,
 			ReplyStatus: "Not Replied",
 		}
@@ -792,6 +714,7 @@ func (a *Agent) writeToSheet(rec Record) {
 			GroupJID:    root.GroupJID,
 			SenderName:  root.SenderName,
 			SenderPhone: root.SenderPhone,
+			MessageType: root.MessageType,
 			Message:     root.Message,
 			Date:        root.DateSent,
 		}
@@ -875,19 +798,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Google Sheets
 	credJSON := strings.TrimSpace(os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 	if credJSON == "" {
 		fmt.Println("GOOGLE_SERVICE_ACCOUNT_JSON is not set in environment")
 		os.Exit(1)
-	}
-	// If it's a file path, read the actual JSON content
-	if strings.HasSuffix(credJSON, ".json") {
-		b, err := os.ReadFile(credJSON)
-		if err != nil {
-			fmt.Printf("failed to read service account file: %v\n", err)
-			os.Exit(1)
-		}
-		credJSON = string(b)
 	}
 	sheetID := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_ID"))
 	sheetName := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_NAME"))
@@ -931,19 +846,6 @@ func main() {
 		fmt.Printf("connect error: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Pre-warm group name cache to avoid blocking event handler on first message
-	// Pre-warm group name cache to avoid blocking event handler on first message
-	go func() {
-		time.Sleep(3 * time.Second) // wait for connection to stabilize
-		groups, err := client.GetJoinedGroups(context.Background())
-		if err == nil {
-			for _, g := range groups {
-				agent.groupCache.Store(g.JID.String(), g.Name)
-			}
-			fmt.Printf("[Agent] Pre-warmed group cache: %d groups\n", len(groups))
-		}
-	}()
 
 	<-ctx.Done()
 	fmt.Println("\nShutting down...")
