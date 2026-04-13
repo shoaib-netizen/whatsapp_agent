@@ -941,18 +941,13 @@ func main() {
 		}
 	}()
 
-	// Auto-reconnect loop
-	for {
-		if err = client.Connect(); err != nil {
-			fmt.Printf("connect error: %v\n", err)
-		}
-		select {
-		case <-ctx.Done():
-			fmt.Println("\nShutting down...")
-			client.Disconnect()
-			return
-		case <-time.After(5 * time.Second):
-			fmt.Println("[Agent] Reconnecting to WhatsApp...")
-		}
+	// Connect once
+	if err = client.Connect(); err != nil {
+		fmt.Printf("connect error: %v\n", err)
+		os.Exit(1)
 	}
+
+	<-ctx.Done()
+	fmt.Println("\nShutting down...")
+	client.Disconnect()
 }
