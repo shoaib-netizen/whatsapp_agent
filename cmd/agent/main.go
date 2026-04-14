@@ -894,7 +894,7 @@ func main() {
 	sheetID := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_ID"))
 	sheetName := strings.TrimSpace(os.Getenv("GOOGLE_SHEET_NAME"))
 	if sheetName == "" {
-		sheetName = "Sheet2"
+		sheetName = "Sheet3"
 	}
 	if sheetID == "" {
 		fmt.Println("GOOGLE_SHEET_ID is not set in .env")
